@@ -87,5 +87,12 @@ for i in range(0, detections.shape[2]):
 
 # show the output image
 cv2.imshow("Output", image)
-cv2.waitKey(0)
+
+# close image window
+while True:
+	key = cv2.waitKey(1) & 0xFF
+	# if the `q` key was pressed, break from the loop
+	if key == ord("q"):
+		break
+cv2.destroyAllWindows()
 
