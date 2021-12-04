@@ -1,140 +1,124 @@
+# USAGE
+# python train_simple_nn.py --dataset animals --model output/simple_nn.model --label-bin output/simple_nn_lb.pickle --plot output/simple_nn_plot.png
+
+# set the matplotlib backend so figures can be saved in the background
+import matplotlib
+matplotlib.use("Agg")
+
 # import the necessary packages
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.layers import AveragePooling2D
-from tensorflow.keras.layers import Dropout
-from tensorflow.keras.layers import Flatten
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.layers import Input
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-from tensorflow.keras.preprocessing.image import img_to_array
-from tensorflow.keras.preprocessing.image import load_img
-from tensorflow.keras.utils import to_categorical
 from sklearn.preprocessing import LabelBinarizer
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import SGD
 from imutils import paths
 import matplotlib.pyplot as plt
 import numpy as np
 import argparse
+import random
+import pickle
+import cv2
 import os
 
 # construct the argument parser and parse the arguments
 ap = argparse.ArgumentParser()
 ap.add_argument("-d", "--dataset", required=True,
-	help="path to input dataset")
-ap.add_argument("-p", "--plot", type=str, default="plot.png",
-	help="path to output loss/accuracy plot")
-ap.add_argument("-m", "--model", type=str,
-	default="mask_detector.model",
-	help="path to output face mask detector model")
+	help="path to input dataset of images")
+ap.add_argument("-m", "--model", required=True,
+	help="path to output trained model")
+ap.add_argument("-l", "--label-bin", required=True,
+	help="path to output label binarizer")
+ap.add_argument("-p", "--plot", required=True,
+	help="path to output accuracy/loss plot")
 args = vars(ap.parse_args())
 
-# initialize the initial learning rate, number of epochs to train for,
-# and batch size
-INIT_LR = 1e-4
-EPOCHS = 20
-BS = 32
-
-# grab the list of images in our dataset directory, then initialize
-# the list of data (i.e., images) and class images
+# initialize the data and labels
 print("[INFO] loading images...")
-imagePaths = list(paths.list_images(args["dataset"]))
 data = []
 labels = []
-# loop over the image paths
+
+# grab the image paths and randomly shuffle them
+imagePaths = sorted(list(paths.list_images(args["dataset"])))
+random.seed(42)
+random.shuffle(imagePaths)
+
+# loop over the input images
 for imagePath in imagePaths:
-	# extract the class label from the filename
-	label = imagePath.split(os.path.sep)[-2]
-	# load the input image (224x224) and preprocess it
-	image = load_img(imagePath, target_size=(224, 224))
-	image = img_to_array(image)
-	image = preprocess_input(image)
-	# update the data and labels lists, respectively
+	# load the image, resize the image to be 32x32 pixels (ignoring
+	# aspect ratio), flatten the image into 32x32x3=3072 pixel image
+	# into a list, and store the image in the data list
+	image = cv2.imread(imagePath)
+	image = cv2.resize(image, (32, 32)).flatten()
 	data.append(image)
+
+	# extract the class label from the image path and update the
+	# labels list
+	label = imagePath.split(os.path.sep)[-2]
 	labels.append(label)
-# convert the data and labels to NumPy arrays
-data = np.array(data, dtype="float32")
+
+# scale the raw pixel intensities to the range [0, 1]
+data = np.array(data, dtype="float") / 255.0
 labels = np.array(labels)
 
-# perform one-hot encoding on the labels
+# partition the data into training and testing splits using 75% of
+# the data for training and the remaining 25% for testing
+(trainX, testX, trainY, testY) = train_test_split(data,
+	labels, test_size=0.25, random_state=42)
+
+# convert the labels from integers to vectors (for 2-class, binary
+# classification you should use Keras' to_categorical function
+# instead as the scikit-learn's LabelBinarizer will not return a
+# vector)
 lb = LabelBinarizer()
-labels = lb.fit_transform(labels)
-labels = to_categorical(labels)
-# partition the data into training and testing splits using 80% of
-# the data for training and the remaining 20% for testing
-(trainX, testX, trainY, testY) = train_test_split(data, labels,
-	test_size=0.20, stratify=labels, random_state=42)
-# construct the training image generator for data augmentation
-aug = ImageDataGenerator(
-	rotation_range=20,
-	zoom_range=0.15,
-	width_shift_range=0.2,
-	height_shift_range=0.2,
-	shear_range=0.15,
-	horizontal_flip=True,
-	fill_mode="nearest")
+trainY = lb.fit_transform(trainY)
+testY = lb.transform(testY)
 
-# load the MobileNetV2 network, ensuring the head FC layer sets are
-# left off
-baseModel = MobileNetV2(weights="imagenet", include_top=False,
-	input_tensor=Input(shape=(224, 224, 3)))
-# construct the head of the model that will be placed on top of the
-# the base model
-headModel = baseModel.output
-headModel = AveragePooling2D(pool_size=(7, 7))(headModel)
-headModel = Flatten(name="flatten")(headModel)
-headModel = Dense(128, activation="relu")(headModel)
-headModel = Dropout(0.5)(headModel)
-headModel = Dense(2, activation="softmax")(headModel)
-# place the head FC model on top of the base model (this will become
-# the actual model we will train)
-model = Model(inputs=baseModel.input, outputs=headModel)
-# loop over all layers in the base model and freeze them so they will
-# *not* be updated during the first training process
-for layer in baseModel.layers:
-	layer.trainable = False
+# define the 3072-1024-512-3 architecture using Keras
+model = Sequential()
+model.add(Dense(1024, input_shape=(3072,), activation="sigmoid"))
+model.add(Dense(512, activation="sigmoid"))
+model.add(Dense(len(lb.classes_), activation="softmax"))
 
-# compile our model
-print("[INFO] compiling model...")
-opt = Adam(lr=INIT_LR, decay=INIT_LR / EPOCHS)
-# model.compile(loss="categorical_crossentropy", optimizer=opt,
-model.compile(loss="binary_crossentropy", optimizer=opt,
+# initialize our initial learning rate and # of epochs to train for
+INIT_LR = 0.01
+EPOCHS = 20
+
+# compile the model using SGD as our optimizer and categorical
+# cross-entropy loss (you'll want to use binary_crossentropy
+# for 2-class classification)
+print("[INFO] training network...")
+opt = SGD(lr=INIT_LR)
+model.compile(loss="categorical_crossentropy", optimizer=opt,
 	metrics=["accuracy"])
-# train the head of the network
-print("[INFO] training head...")
-H = model.fit(
-	aug.flow(trainX, trainY, batch_size=BS),
-	steps_per_epoch=len(trainX) // BS,
-	validation_data=(testX, testY),
-	validation_steps=len(testX) // BS,
-	epochs=EPOCHS)
 
-# make predictions on the testing set
+# train the neural network
+H = model.fit(x=trainX, y=trainY, validation_data=(testX, testY),
+	epochs=EPOCHS, batch_size=32)
+
+# evaluate the network
 print("[INFO] evaluating network...")
-predIdxs = model.predict(testX, batch_size=BS)
-# for each image in the testing set we need to find the index of the
-# label with corresponding largest predicted probability
-predIdxs = np.argmax(predIdxs, axis=1)
-# show a nicely formatted classification report
-print(classification_report(testY.argmax(axis=1), predIdxs,
-	target_names=lb.classes_))
-# serialize the model to disk
-print("[INFO] saving mask detector model...")
-model.save(args["model"], save_format="h5")
+predictions = model.predict(x=testX, batch_size=32)
+print(classification_report(testY.argmax(axis=1),
+	predictions.argmax(axis=1), target_names=lb.classes_))
 
 # plot the training loss and accuracy
-N = EPOCHS
+N = np.arange(0, EPOCHS)
 plt.style.use("ggplot")
 plt.figure()
-plt.plot(np.arange(0, N), H.history["loss"], label="train_loss")
-plt.plot(np.arange(0, N), H.history["val_loss"], label="val_loss")
-plt.plot(np.arange(0, N), H.history["accuracy"], label="train_acc")
-plt.plot(np.arange(0, N), H.history["val_accuracy"], label="val_acc")
-plt.title("Training Loss and Accuracy")
+plt.plot(N, H.history["loss"], label="train_loss")
+plt.plot(N, H.history["val_loss"], label="val_loss")
+plt.plot(N, H.history["accuracy"], label="train_acc")
+plt.plot(N, H.history["val_accuracy"], label="val_acc")
+plt.title("Training Loss and Accuracy (Simple NN)")
 plt.xlabel("Epoch #")
 plt.ylabel("Loss/Accuracy")
-plt.legend(loc="lower left")
+plt.legend()
 plt.savefig(args["plot"])
+
+# save the model and label binarizer to disk
+print("[INFO] serializing network and label binarizer...")
+model.save(args["model"], save_format="h5")
+f = open(args["label_bin"], "wb")
+f.write(pickle.dumps(lb))
+f.close()
